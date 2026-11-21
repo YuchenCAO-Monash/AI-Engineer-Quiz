@@ -30,11 +30,7 @@
         <strong>Keepstack</strong>
       </div>
       <div class="search-box">
-        <input id="search" placeholder="Search assets, tags, metadata...">
-        <select id="search-mode" title="Search mode">
-          <option value="keyword">Keyword</option>
-          <option value="semantic">Semantic</option>
-        </select>
+        <input id="search" aria-label="Search assets" placeholder="Search assets, tags, metadata...">
       </div>
       <div class="topbar-right">
         <button id="btn-upload" class="btn btn-primary">Upload</button>
@@ -72,17 +68,56 @@
           <div class="view-head">
             <h2 id="result-title">Library</h2>
             <div class="view-controls">
-              <span id="active-filter" class="chip hidden"></span>
-              <select id="sort">
+              <select id="sort" aria-label="Sort assets">
                 <option value="newest">Newest</option>
                 <option value="oldest">Oldest</option>
                 <option value="name">Name</option>
                 <option value="largest">Largest</option>
               </select>
+              <!-- 导出当前筛选下的全部匹配素材。 -->
+              <button id="export-csv" class="btn" type="button">Export CSV</button>
             </div>
+          </div>
+          <!-- 两组标签分别输入和显示，方便查看、移除或清除筛选条件。 -->
+          <section class="library-filters" aria-label="Asset filters">
+            <div class="tag-filter-fields">
+              <form id="include-tags-form" class="tag-filter">
+                <label for="include-tag-input">Include all tags</label>
+                <div class="tag-filter-entry">
+                  <input id="include-tag-input" list="library-tag-options" autocomplete="off" placeholder="Tag name" required>
+                  <button class="btn" type="submit" aria-label="Add included tag">Add</button>
+                </div>
+                <div id="included-tags" class="tag-filter-values" aria-live="polite"></div>
+              </form>
+              <form id="exclude-tags-form" class="tag-filter">
+                <label for="exclude-tag-input">Exclude any tag</label>
+                <div class="tag-filter-entry">
+                  <input id="exclude-tag-input" list="library-tag-options" autocomplete="off" placeholder="Tag name" required>
+                  <button class="btn" type="submit" aria-label="Add excluded tag">Add</button>
+                </div>
+                <div id="excluded-tags" class="tag-filter-values" aria-live="polite"></div>
+              </form>
+            </div>
+            <datalist id="library-tag-options"></datalist>
+            <div class="library-filter-scope">
+              <div id="active-filters" class="tag-filter-values"></div>
+              <button id="clear-filters" class="btn btn-ghost" type="button" disabled>Clear filters</button>
+            </div>
+          </section>
+          <div id="library-loading" class="empty hidden" role="status">Loading assets…</div>
+          <div id="library-error" class="empty hidden">
+            <span class="error" role="alert">Could not load assets.</span>
+            <button id="retry-library" class="btn" type="button">Retry</button>
           </div>
           <div id="grid" class="grid"></div>
           <div id="empty" class="empty hidden">No assets yet. Click Upload to get started.</div>
+
+          <!-- 分页区保留总匹配数的结果标题，并在这里显示当前页和总页数。 -->
+          <nav id="library-pagination" class="library-pagination hidden" aria-label="Asset pagination">
+            <button id="previous-page" class="btn" type="button" disabled>Previous page</button>
+            <span id="page-status" class="muted" aria-live="polite"></span>
+            <button id="next-page" class="btn" type="button" disabled>Next page</button>
+          </nav>
         </div>
 
         <div id="view-collections" class="view hidden">
@@ -145,7 +180,7 @@
     </div>
   </div>
 
-  <div id="toast" class="toast hidden"></div>
+  <div id="toast" class="toast hidden" role="status"></div>
 
   <script src="/app.js"></script>
 </body>

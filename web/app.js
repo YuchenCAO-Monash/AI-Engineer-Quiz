@@ -2,7 +2,8 @@
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const state = { token: localStorage.getItem("keepstack_token"), user: null,
-  q: "", mode: "keyword", media: null, tag: null, sort: "newest", collection: null };
+  q: "", media: null, includeTags: new Set(), excludeTags: new Set(),
+  sort: "newest", collection: null, page: 1 };
 
 // ---------- API helper ----------
 async function api(path, opts = {}) {
@@ -61,29 +62,199 @@ $$(".nav-item").forEach(btn => btn.addEventListener("click", () => {
 }));
 
 // ---------- library / search ----------
+const libraryPageSize = 15;
 let searchTimer;
-$("#search").addEventListener("input", (e) => { state.q = e.target.value; clearTimeout(searchTimer); searchTimer = setTimeout(loadLibrary, 250); });
-$("#search-mode").addEventListener("change", (e) => { state.mode = e.target.value; loadLibrary(); });
-$("#sort").addEventListener("change", (e) => { state.sort = e.target.value; loadLibrary(); });
-$("#active-filter").addEventListener("click", () => { state.media = null; state.tag = null; state.collection = null; loadLibrary(); });
+let libraryRequest = 0;
+const tagFilters = [
+  { form: $("#include-tags-form"), list: $("#included-tags"), tags: state.includeTags, side: "included" },
+  { form: $("#exclude-tags-form"), list: $("#excluded-tags"), tags: state.excludeTags, side: "excluded" },
+];
 
-async function loadLibrary() {
-  const p = new URLSearchParams({ q: state.q, sort: state.sort, mode: state.mode, limit: "120" });
-  if (state.media) p.set("media_type", state.media);
-  if (state.tag) p.set("tag", state.tag);
-  if (state.collection) p.set("collection_id", state.collection);
-  const data = await api("/api/assets?" + p.toString());
-  renderFacets(data.facets);
-  renderGrid(data.items, data.total);
-  const filt = state.media || (state.tag ? "#" + state.tag : null) || (state.collection ? "collection" : null);
-  $("#active-filter").classList.toggle("hidden", !filt);
-  if (filt) $("#active-filter").textContent = filt;
+$("#search").addEventListener("input", (event) => {
+  state.q = event.target.value;
+  loadLibrary({ delay: 250 });
+});
+$("#sort").addEventListener("change", (event) => {
+  state.sort = event.target.value;
+  loadLibrary();
+});
+$("#previous-page").addEventListener("click", () => loadLibrary({ page: state.page - 1 }));
+$("#next-page").addEventListener("click", () => loadLibrary({ page: state.page + 1 }));
+$("#retry-library").addEventListener("click", () => loadLibrary({ page: state.page }));
+$("#export-csv").addEventListener("click", downloadCsv);
+
+for (const { form, tags } of tagFilters) {
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const input = $("input", form);
+    // 每次加入一个完整标签，保留标签名中的逗号和内部空格。
+    const tag = input.value.trim().toLowerCase();
+    if (!tag) return;
+
+    const alreadySelected = tags.has(tag);
+    tags.add(tag);
+    input.value = "";
+    input.focus();
+    if (!alreadySelected) loadLibrary();
+  });
+}
+
+$("#clear-filters").addEventListener("click", () => {
+  state.q = "";
+  $("#search").value = "";
+  state.media = null;
+  state.collection = null;
+  for (const { form, tags } of tagFilters) {
+    tags.clear();
+    form.reset();
+  }
+  loadLibrary();
+});
+
+function hasLibraryFilters() {
+  return Boolean(state.q.trim() || state.media || state.collection ||
+    state.includeTags.size || state.excludeTags.size);
+}
+
+function filterChip(label, removeLabel, remove) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "chip";
+  button.textContent = label;
+  button.setAttribute("aria-label", removeLabel);
+  button.addEventListener("click", () => {
+    remove();
+    loadLibrary();
+  });
+  return button;
+}
+
+function renderLibraryFilters() {
+  for (const { list, tags, side } of tagFilters) {
+    list.replaceChildren(...Array.from(tags, (tag) =>
+      filterChip(tag, `Remove ${side} tag: ${tag}`, () => tags.delete(tag))
+    ));
+  }
+
+  const scope = $("#active-filters");
+  scope.replaceChildren();
+  if (state.collection) {
+    scope.append(filterChip(`Collection: ${state.collection.name}`, "Clear collection filter", () => {
+      state.collection = null;
+    }));
+  }
+  if (state.media) {
+    scope.append(filterChip(`Media type: ${state.media}`, "Clear media type filter", () => {
+      state.media = null;
+    }));
+  }
+  $("#clear-filters").disabled = !hasLibraryFilters();
+}
+
+function loadLibrary({ delay = 0, page = 1 } = {}) {
+  clearTimeout(searchTimer);
+  // 筛选和排序的调用都默认回到第一页，翻页和重试才传入指定页码。
+  state.page = page;
+  // 防抖期间也要使旧请求失效，避免迟到的响应覆盖最新条件。
+  const request = ++libraryRequest;
+  renderLibraryFilters();
+
+  $("#result-title").textContent = hasLibraryFilters() ? "Results" : "Library";
+  $("#library-loading").classList.remove("hidden");
+  $("#library-error").classList.add("hidden");
+  $("#grid").classList.add("hidden");
+  $("#empty").classList.add("hidden");
+  $("#previous-page").disabled = true;
+  $("#next-page").disabled = true;
+
+  if (delay) {
+    searchTimer = setTimeout(() => fetchLibrary(request), delay);
+  } else {
+    void fetchLibrary(request);
+  }
+}
+
+function librarySearchParams() {
+  const params = new URLSearchParams({ q: state.q, sort: state.sort });
+  if (state.media) params.set("media_type", state.media);
+  if (state.collection) params.set("collection_id", state.collection.id);
+
+  // 接口使用同名的重复参数接收多标签，URLSearchParams 负责转义特殊字符。
+  for (const tag of state.includeTags) params.append("include_tag", tag);
+  for (const tag of state.excludeTags) params.append("exclude_tag", tag);
+  return params;
+}
+
+async function downloadCsv(event) {
+  const button = event.currentTarget;
+  // 导出复用列表的筛选参数。通过 api() 下载时会附带登录令牌。
+  const params = librarySearchParams();
+  button.disabled = true;
+  button.textContent = "Exporting…";
+  try {
+    const response = await api("/api/assets/export.csv?" + params.toString());
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "keepstack-assets.csv";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch {
+    toast("Could not download CSV. Please try again.", "err");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Export CSV";
+  }
+}
+
+async function fetchLibrary(request) {
+  // 分页参数只在列表请求中添加，offset 表示要跳过的素材条数。
+  const params = librarySearchParams();
+  params.set("limit", libraryPageSize);
+  params.set("offset", (state.page - 1) * libraryPageSize);
+
+  try {
+    const data = await api("/api/assets?" + params.toString());
+    if (request !== libraryRequest) return;
+
+    const pages = Math.ceil(data.total / libraryPageSize);
+    const lastPage = Math.max(1, pages);
+    // 数据减少导致当前页消失时，重新查询最后一个有效页。
+    if (state.page > lastPage) {
+      loadLibrary({ page: lastPage });
+      return;
+    }
+
+    renderFacets(data.facets);
+    renderGrid(data.items, data.total);
+    renderPagination(pages);
+  } catch {
+    if (request !== libraryRequest) return;
+    $("#library-pagination").classList.add("hidden");
+    $("#library-error").classList.remove("hidden");
+  } finally {
+    if (request === libraryRequest) $("#library-loading").classList.add("hidden");
+  }
+}
+
+function renderPagination(pages) {
+  $("#library-pagination").classList.toggle("hidden", pages === 0);
+  $("#page-status").textContent = `Page ${state.page} of ${pages}`;
+  $("#previous-page").disabled = state.page <= 1;
+  $("#next-page").disabled = state.page >= pages;
 }
 
 function renderGrid(items, total) {
-  $("#result-title").textContent = state.q ? `Results (${total})` : `Library (${total})`;
-  $("#empty").classList.toggle("hidden", items.length > 0);
-  $("#grid").innerHTML = items.map(a => `
+  const filtered = hasLibraryFilters();
+  $("#result-title").textContent = filtered ? `Results (${total})` : `Library (${total})`;
+  const empty = $("#empty");
+  empty.classList.toggle("hidden", items.length > 0);
+  empty.textContent = filtered ? "No assets match these filters." : "No assets yet. Click Upload to get started.";
+  const grid = $("#grid");
+  grid.classList.remove("hidden");
+  grid.innerHTML = items.map(a => `
     <div class="card" data-uuid="${a.uuid}">
       <img class="thumb" loading="lazy" src="/api/assets/${a.uuid}/thumb" alt="${esc(a.alt_text || a.title)}">
       <div class="meta">
@@ -97,10 +268,26 @@ function renderGrid(items, total) {
 function renderFacets(facets) {
   $("#facet-media").innerHTML = (facets.media_types || []).map(m =>
     `<li class="${state.media===m.value?'active':''}" data-media="${m.value}"><span>${m.value}</span><span class="count">${m.count}</span></li>`).join("");
-  $("#facet-tags").innerHTML = (facets.tags || []).slice(0, 18).map(t =>
-    `<li class="${state.tag===t.value?'active':''}" data-tag="${esc(t.value)}"><span>${esc(t.value)}</span><span class="count">${t.count}</span></li>`).join("");
-  $$("#facet-media li").forEach(li => li.addEventListener("click", () => { state.media = state.media===li.dataset.media?null:li.dataset.media; loadLibrary(); }));
-  $$("#facet-tags li").forEach(li => li.addEventListener("click", () => { state.tag = state.tag===li.dataset.tag?null:li.dataset.tag; loadLibrary(); }));
+  const tags = facets.tags || [];
+  $("#library-tag-options").replaceChildren(...tags.map(({ value }) => {
+    const option = document.createElement("option");
+    option.value = value;
+    return option;
+  }));
+  $("#facet-tags").innerHTML = tags.slice(0, 18).map(({ value, count }) => {
+    const selected = state.includeTags.has(value);
+    return `<li class="${selected ? "active" : ""}"><button type="button" data-tag="${esc(value)}" aria-pressed="${selected}"><span>${esc(value)}</span><span class="count">${count}</span></button></li>`;
+  }).join("");
+  $$("#facet-media li").forEach(li => li.addEventListener("click", () => {
+    state.media = state.media === li.dataset.media ? null : li.dataset.media;
+    loadLibrary();
+  }));
+  $$("#facet-tags button").forEach(button => button.addEventListener("click", () => {
+    const tag = button.dataset.tag;
+    if (state.includeTags.has(tag)) state.includeTags.delete(tag);
+    else state.includeTags.add(tag);
+    loadLibrary();
+  }));
 }
 
 // ---------- asset detail drawer ----------
@@ -168,21 +355,28 @@ async function openAsset(uuid) {
   // wire detail actions
   $$("#drawer-body .similar-strip img").forEach(img => img.addEventListener("click", () => openAsset(img.dataset.uuid)));
   if (canEdit) {
+    const refreshAfterEdit = () => {
+      // 保存成功后重新查询素材库，标题、描述或标签变化都可能改变当前匹配结果。
+      loadLibrary();
+      void openAsset(uuid);
+    };
+
     $("#d-save")?.addEventListener("click", async () => {
       const body = {};
       ["title","description","alt_text","dc_creator","rights_statement","retention_until"].forEach(f => { const el = $("#e-"+f); if (el) body[f] = el.value; });
       await api("/api/assets/"+uuid, { method: "PATCH", json: body });
-      toast("Saved"); openAsset(uuid); loadLibrary();
+      toast("Saved");
+      refreshAfterEdit();
     });
     $("#tag-add")?.addEventListener("keydown", async (e) => {
       if (e.key === "Enter" && e.target.value.trim()) {
         await api("/api/assets/"+uuid+"/tags", { json: { name: e.target.value.trim() } });
-        openAsset(uuid);
+        refreshAfterEdit();
       }
     });
     $$("#tag-row .rm").forEach(rm => rm.addEventListener("click", async () => {
       await api("/api/assets/"+uuid+"/tags/"+encodeURIComponent(rm.dataset.tag), { method: "DELETE" });
-      openAsset(uuid);
+      refreshAfterEdit();
     }));
     $("#d-share")?.addEventListener("click", async () => {
       const r = await api("/api/shares", { json: { target_type: "asset", target_id: a.id, permission: "download" } });
@@ -229,10 +423,11 @@ async function uploadFiles(files) {
 async function loadCollections() {
   const data = await api("/api/collections");
   $("#collection-list").innerHTML = data.collections.map(c =>
-    `<div class="collection-card" data-id="${c.id}"><span class="n">${esc(c.name)}</span><span class="muted">${c.asset_count} assets</span><span class="muted">${esc(c.description||"")}</span></div>`).join("")
+    `<div class="collection-card" data-id="${c.id}" data-name="${esc(c.name)}"><span class="n">${esc(c.name)}</span><span class="muted">${c.asset_count} assets</span><span class="muted">${esc(c.description||"")}</span></div>`).join("")
     || '<p class="muted">No collections yet.</p>';
   $$("#collection-list .collection-card").forEach(card => card.addEventListener("click", () => {
-    state.collection = card.dataset.id; state.media = null; state.tag = null;
+    // 选择集合时保留关键词、素材类型和两组标签，让条件可以继续叠加。
+    state.collection = { id: card.dataset.id, name: card.dataset.name };
     $$(".nav-item").forEach(b => b.classList.remove("active"));
     $('.nav-item[data-view="library"]').classList.add("active");
     $$(".view").forEach(v => v.classList.add("hidden")); $("#view-library").classList.remove("hidden");

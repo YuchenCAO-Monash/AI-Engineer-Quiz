@@ -3,6 +3,7 @@
 These run against a throwaway data directory so they never touch a real
 repository. Run with:  python -m pytest -q
 """
+import csv
 import io
 import json
 import os
@@ -107,6 +108,354 @@ def test_keyword_search_finds_by_title():
     res = search.search(q="harbor")
     assert res["total"] >= 1
     assert any("harbor" in (i["title"] or "").lower() for i in res["items"])
+
+
+def test_collection_search_with_keyword_and_tag():
+    matching = ingest.ingest_stream(
+        io.BytesIO(_img_bytes(color=(31, 72, 184))),
+        "collection_match.jpg", title="Collectionbeacon inside",
+    )
+    other_member = ingest.ingest_stream(
+        io.BytesIO(_img_bytes(color=(88, 164, 38))),
+        "collection_other.jpg", title="Other collection member",
+    )
+    outside = ingest.ingest_stream(
+        io.BytesIO(_img_bytes(color=(182, 43, 67))),
+        "collection_outside.jpg", title="Collectionbeacon outside",
+    )
+
+    with get_conn() as conn:
+        collection_id = conn.execute(
+            "INSERT INTO collections (uuid, name, created_at) VALUES (?, ?, ?)",
+            ("collection-search-test", "Collection search test", matching["created_at"]),
+        ).lastrowid
+        conn.executemany(
+            "INSERT INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
+            [(collection_id, matching["id"]), (collection_id, other_member["id"])],
+        )
+        tag_id = conn.execute(
+            "INSERT INTO tags (name) VALUES (?)", ("collectionproof",),
+        ).lastrowid
+        conn.executemany(
+            "INSERT INTO asset_tags (asset_id, tag_id) VALUES (?, ?)",
+            [(matching["id"], tag_id), (outside["id"], tag_id)],
+        )
+
+    result = search.search(collection_id=collection_id)
+    assert result["total"] == 2
+    assert {item["uuid"] for item in result["items"]} == {
+        matching["uuid"], other_member["uuid"],
+    }
+
+    for filters in (
+        {"q": "collectionbeacon"},
+        {"tag": "COLLECTIONPROOF"},
+        {"q": "collectionbeacon", "tag": "collectionproof", "media_type": "image"},
+    ):
+        result = search.search(collection_id=collection_id, **filters)
+        assert result["total"] == 1
+        assert [item["uuid"] for item in result["items"]] == [matching["uuid"]]
+
+
+def test_asset_search_accepts_repeated_tag_filters():
+    from fastapi.testclient import TestClient
+    from keepstack.app import app
+    from keepstack.config import config
+
+    samples = {
+        "match": ("approved", "campaign", "planning, q2"),
+        "partial": ("approved",),
+        "internal": ("approved", "campaign", "internal"),
+        "draft": ("approved", "campaign", "draft"),
+        "similar": ("preapproved", "campaign"),
+    }
+    with TestClient(app) as client:
+        login = client.post("/api/auth/login", json={
+            "username": config.admin_user, "password": config.admin_password,
+        })
+        assert login.status_code == 200
+        headers = {"Authorization": "Bearer " + login.json()["token"]}
+
+        uuids = {}
+        for index, (sample, names) in enumerate(samples.items(), start=1):
+            upload = client.post(
+                "/api/assets", headers=headers, data={"run_ai": "false"},
+                files={"files": (
+                    f"tagfiltercase-{sample}.jpg",
+                    _img_bytes(color=(index * 40, 96, 147)),
+                    "image/jpeg",
+                )},
+            )
+            assert upload.status_code == 200
+            uuid = upload.json()["created"][0]["uuid"]
+            uuids[sample] = uuid
+            for name in names:
+                response = client.post(
+                    f"/api/assets/{uuid}/tags", headers=headers, json={"name": name},
+                )
+                assert response.status_code == 200
+
+        keyword = ("q", "tagfiltercase")
+        filters = [
+            keyword,
+            ("include_tag", " APPROVED "),
+            ("include_tag", "approved"),
+            ("include_tag", "campaign"),
+            ("exclude_tag", "internal"),
+            ("exclude_tag", "draft"),
+            ("exclude_tag", "unknown-tag"),
+        ]
+        for params, expected in (
+            (filters, [uuids["match"]]),
+            (filters + [("exclude_tag", " APPROVED ")], []),
+            (filters + [("include_tag", "unknown-tag")], []),
+            ([keyword, ("include_tag", "planning, q2")], [uuids["match"]]),
+        ):
+            response = client.get("/api/assets", params=params, headers=headers)
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["total"] == len(expected)
+            assert [item["uuid"] for item in payload["items"]] == expected
+
+
+def test_keyword_search_paginates_in_stable_creation_order():
+    from fastapi.testclient import TestClient
+    from keepstack.app import app
+    from keepstack.config import config
+
+    dates = (
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-02T00:00:00+00:00",
+        "2026-01-03T00:00:00+00:00",
+        "2026-01-02T00:00:00+00:00",
+    )
+    assets = []
+    for index, created_at in enumerate(dates):
+        asset = ingest.ingest_stream(
+            io.BytesIO(_img_bytes(color=(24 + index * 50, 138, 64))),
+            f"pagesortfixture-{index}.jpg", run_ai=False,
+        )
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE assets SET created_at = ? WHERE id = ?", (created_at, asset["id"]),
+            )
+        assets.append(asset["uuid"])
+
+    with TestClient(app) as client:
+        login = client.post("/api/auth/login", json={
+            "username": config.admin_user, "password": config.admin_password,
+        })
+        assert login.status_code == 200
+        headers = {"Authorization": "Bearer " + login.json()["token"]}
+
+        # 两个相同时间的素材分别落在两页，验证并列时也不会重漏。
+        for sort, expected_order in (
+            ("newest", [2, 3, 1, 0]),
+            ("oldest", [0, 1, 3, 2]),
+        ):
+            for offset in (0, 2, 4):
+                response = client.get("/api/assets", headers=headers, params={
+                    "q": "pagesortfixture", "sort": sort, "limit": 2, "offset": offset,
+                })
+                assert response.status_code == 200
+                data = response.json()
+                assert data["total"] == 4
+                assert [item["uuid"] for item in data["items"]] == [
+                    assets[index] for index in expected_order[offset:offset + 2]
+                ]
+
+        for params in (
+            {"limit": 0}, {"limit": 201}, {"offset": -1},
+            {"offset": "abc"}, {"offset": 2**63},
+        ):
+            assert client.get("/api/assets", params=params, headers=headers).status_code == 422
+
+        response = client.get("/api/assets", params={"q": ' "!?- '}, headers=headers)
+        assert response.status_code == 200
+        assert response.json()["total"] == 0
+        assert response.json()["items"] == []
+
+        response = client.get("/api/assets", params={"q": "pagesortfixture!?"}, headers=headers)
+        assert response.status_code == 200
+        assert response.json()["total"] == 4
+
+
+def test_csv_export_matches_all_filtered_pages():
+    from fastapi.testclient import TestClient
+    from keepstack.app import app
+    from keepstack.config import config
+
+    special_title = '港口, "夜景"'
+    special_description = '第一行, "说明"\n第二行'
+    special_tag = '素材, "港口"'
+    standard_tags = ("approved", "campaign")
+    samples = (
+        ("first", "image", "active", True, (*standard_tags, special_tag)),
+        ("second", "image", "active", True, standard_tags),
+        ("third", "image", "active", True, standard_tags),
+        ("internal", "image", "active", True, (*standard_tags, "internal")),
+        ("outside", "image", "active", False, standard_tags),
+        ("document", "document", "active", True, standard_tags),
+        ("deleted", "image", "deleted", True, standard_tags),
+        ("partial", "image", "active", True, ("approved",)),
+        ("different-keyword", "image", "active", True, standard_tags),
+    )
+    assets = {}
+    for index, (name, _, _, _, _) in enumerate(samples):
+        prefix = "unrelated" if name == "different-keyword" else "csvexportfixture"
+        assets[name] = ingest.ingest_stream(
+            io.BytesIO(_img_bytes(color=(17 + 19 * index, 48, 192))),
+            f"{prefix}-{name}.jpg", run_ai=False,
+            title=special_title if name == "first" else None,
+        )
+
+    fixed_time = "2026-01-02T00:00:00+00:00"
+    with get_conn() as conn:
+        collection_id = conn.execute(
+            "INSERT INTO collections (uuid, name, created_at) VALUES (?, ?, ?)",
+            ("csv-export-test", "CSV export test", fixed_time),
+        ).lastrowid
+        for name, media_type, status, in_collection, tags in samples:
+            asset_id = assets[name]["id"]
+            conn.execute(
+                "UPDATE assets SET media_type = ?, status = ?, created_at = ?, description = ? WHERE id = ?",
+                (media_type, status, fixed_time, special_description if name == "first" else None, asset_id),
+            )
+            if in_collection:
+                conn.execute(
+                    "INSERT INTO collection_assets (collection_id, asset_id) VALUES (?, ?)",
+                    (collection_id, asset_id),
+                )
+            for tag in tags:
+                conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (tag,))
+                conn.execute(
+                    "INSERT INTO asset_tags (asset_id, tag_id) SELECT ?, id FROM tags WHERE name = ?",
+                    (asset_id, tag),
+                )
+
+    fields = ["uuid", "title", "description", "filename", "media_type", "tags", "created_at"]
+    filters = [
+        ("q", "csvexportfixture"), ("collection_id", str(collection_id)),
+        ("media_type", "image"), ("include_tag", "APPROVED"),
+        ("include_tag", "campaign"), ("exclude_tag", "internal"),
+    ]
+    with TestClient(app) as client:
+        assert client.get("/api/assets/export.csv").status_code == 401
+        login = client.post("/api/auth/login", json={
+            "username": config.admin_user, "password": config.admin_password,
+        })
+        assert login.status_code == 200
+        headers = {"Authorization": "Bearer " + login.json()["token"]}
+
+        # 列表与导出都拒绝非 active 状态，避免相同参数查出不同范围。
+        for endpoint in ("/api/assets", "/api/assets/export.csv"):
+            response = client.get(endpoint, headers=headers, params=[*filters, ("status", "deleted")])
+            assert response.status_code == 422
+            assert response.json()["detail"][0]["loc"] == ["query", "status"]
+
+        names = ["first", "second", "third"]
+        for sort, ordered, status_params in (
+            ("oldest", names, [("status", "active")]),
+            ("newest", list(reversed(names)), []),
+        ):
+            params = [*filters, ("sort", sort), *status_params]
+            listed_uuids = []
+            for offset in (0, 2):
+                response = client.get("/api/assets", headers=headers, params=[
+                    *params, ("limit", "2"), ("offset", str(offset)),
+                ])
+                assert response.status_code == 200
+                page = response.json()
+                assert page["total"] == 3
+                listed_uuids.extend(item["uuid"] for item in page["items"])
+
+            # 即使请求带着第二页参数，CSV 也应包含全部匹配素材。
+            response = client.get("/api/assets/export.csv", headers=headers, params=[
+                *params, ("limit", "2"), ("offset", "2"),
+            ])
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/csv")
+            assert response.headers["content-disposition"] == 'attachment; filename="keepstack-assets.csv"'
+            reader = csv.DictReader(io.StringIO(response.content.decode("utf-8-sig"), newline=""))
+            rows = list(reader)
+            assert reader.fieldnames == fields
+            assert [row["uuid"] for row in rows] == listed_uuids == [assets[name]["uuid"] for name in ordered]
+            first = next(row for row in rows if row["uuid"] == assets["first"]["uuid"])
+            assert first["title"] == special_title
+            assert first["description"] == special_description
+            assert first["filename"] == assets["first"]["filename"]
+            assert first["media_type"] == "image"
+            assert first["created_at"] == fixed_time
+            assert json.loads(first["tags"]) == ["approved", "campaign", special_tag]
+
+        empty = client.get("/api/assets/export.csv", headers=headers, params={"q": "missingcsvexportfixture"})
+        assert empty.status_code == 200
+        reader = csv.reader(io.StringIO(empty.content.decode("utf-8-sig"), newline=""))
+        assert list(reader) == [fields]
+
+
+def test_asset_edits_update_search_and_csv():
+    from fastapi.testclient import TestClient
+    from keepstack.app import app
+    from keepstack.config import config
+
+    with TestClient(app) as client:
+        login = client.post("/api/auth/login", json={
+            "username": config.admin_user, "password": config.admin_password,
+        })
+        assert login.status_code == 200
+        headers = {"Authorization": "Bearer " + login.json()["token"]}
+        upload = client.post(
+            "/api/assets", headers=headers, data={"run_ai": "false"},
+            files={"files": ("asset-edit-fixture.jpg", _img_bytes(color=(213, 157, 48)), "image/jpeg")},
+        )
+        assert upload.status_code == 200
+        uuid = upload.json()["created"][0]["uuid"]
+        asset_path = f"/api/assets/{uuid}"
+
+        def assert_matches(expected_uuids, **filters):
+            listing = client.get("/api/assets", headers=headers, params=filters)
+            export = client.get("/api/assets/export.csv", headers=headers, params=filters)
+            assert listing.status_code == export.status_code == 200
+            data = listing.json()
+            rows = list(csv.DictReader(io.StringIO(export.content.decode("utf-8-sig"), newline="")))
+            assert data["total"] == len(expected_uuids)
+            assert [item["uuid"] for item in data["items"]] == expected_uuids
+            assert [row["uuid"] for row in rows] == expected_uuids
+            return rows
+
+        # 搜索词只写在对应字段中，避免文件名或其他字段继续命中旧词。
+        first_edit = client.patch(asset_path, headers=headers, json={
+            "title": "harboronly", "description": "oldcaptiononly",
+        })
+        assert first_edit.status_code == 200
+        assert_matches([uuid], q="harboronly")
+        assert_matches([uuid], q="oldcaptiononly")
+
+        next_edit = client.patch(asset_path, headers=headers, json={
+            "title": "alpineonly", "description": "camelliaonly",
+        })
+        assert next_edit.status_code == 200
+        assert_matches([], q="harboronly")
+        assert_matches([], q="oldcaptiononly")
+        for word in ("alpineonly", "camelliaonly"):
+            row, = assert_matches([uuid], q=word)
+            assert row["title"] == "alpineonly"
+            assert row["description"] == "camelliaonly"
+
+        added = client.post(asset_path + "/tags", headers=headers, json={"name": " REVIEWREADY "})
+        assert added.status_code == 200
+        # 标签变化要同时反映在全文搜索和精确标签筛选中。
+        for filters in ({"q": "reviewready"}, {"include_tag": "reviewready"}):
+            row, = assert_matches([uuid], **filters)
+            assert "reviewready" in json.loads(row["tags"])
+
+        removed = client.delete(asset_path + "/tags/reviewready", headers=headers)
+        assert removed.status_code == 200
+        assert_matches([], q="reviewready")
+        assert_matches([], include_tag="reviewready")
+        row, = assert_matches([uuid], q="alpineonly")
+        assert "reviewready" not in json.loads(row["tags"])
 
 
 def test_semantic_search_returns_ranked_results():

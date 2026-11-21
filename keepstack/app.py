@@ -10,13 +10,14 @@ import io
 import ipaddress
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import (Body, Depends, FastAPI, File, Form, HTTPException, Query,
                      Request, UploadFile)
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                PlainTextResponse, Response)
 from fastapi.staticfiles import StaticFiles
+from starlette.types import Scope
 
 from . import __version__, ingest, search, standards, storage, thumbnails
 from .audit import log, now_iso
@@ -173,21 +174,57 @@ async def upload_assets(
     return {"created": results}
 
 
-@app.get("/api/assets")
-def list_assets(
+def asset_search_filters(
     q: str = "",
     media_type: Optional[str] = None,
     tag: Optional[str] = None,
+    # 同一个参数名可以传多次，逗号可以作为标签名的一部分。
+    include_tag: Optional[list[str]] = Query(default=None),
+    exclude_tag: Optional[list[str]] = Query(default=None),
     collection_id: Optional[int] = None,
-    status: str = "active",
     sort: str = "newest",
+    # 列表和导出只查询 active 素材，其他状态由参数校验统一拒绝。
+    status: Literal["active"] = "active",
+) -> dict:
+    # 在同一处解析列表和 CSV 都支持的筛选条件与排序。
+    return {
+        "q": q,
+        "media_type": media_type,
+        "tag": tag,
+        "include_tags": include_tag or (),
+        "exclude_tags": exclude_tag or (),
+        "collection_id": collection_id,
+        "sort": sort,
+        "status": status,
+    }
+
+
+@app.get("/api/assets")
+def list_assets(
+    filters: dict = Depends(asset_search_filters),
     mode: str = "keyword",
-    limit: int = Query(60, le=200),
-    offset: int = 0,
+    limit: int = Query(60, ge=1, le=200),
+    # SQLite 的 OFFSET 使用有符号 64 位整数。
+    offset: int = Query(0, ge=0, le=2**63 - 1),
     user: dict = Depends(require_user),
 ):
-    return search.search(q=q, media_type=media_type, tag=tag, collection_id=collection_id,
-                         status=status, sort=sort, mode=mode, limit=limit, offset=offset)
+    return search.search(**filters, mode=mode, limit=limit, offset=offset)
+
+
+# 固定路径放在素材 UUID 路由前面，避免 export.csv 被当作 UUID。
+@app.get("/api/assets/export.csv")
+def export_assets(
+    filters: dict = Depends(asset_search_filters),
+    user: dict = Depends(require_user),
+):
+    return Response(
+        content=search.export_csv(**filters),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="keepstack-assets.csv"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 def _get_asset_or_404(uuid: str) -> dict:
@@ -692,5 +729,13 @@ def healthz():
 # ---------------------------------------------------------------------------
 # Static SPA (registered last so API routes win)
 # ---------------------------------------------------------------------------
+class WebStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        # 每次使用缓存前都校验静态文件，避免旧页面与新脚本混用。
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 if WEB_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
+    app.mount("/", WebStaticFiles(directory=str(WEB_DIR), html=True), name="web")

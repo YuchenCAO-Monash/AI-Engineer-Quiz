@@ -85,11 +85,6 @@ button, input, select { font-family: inherit; font-size: inherit; }
   flex: 1; background: var(--base-0); border: 1px solid var(--base-3); color: var(--text);
   padding: var(--s2) var(--s2); border-radius: var(--radius-sm);
 }
-.search-box select {
-  background: var(--base-0) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%2364708a' stroke-width='1.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 12px center;
-  border: 1px solid var(--base-3); color: var(--text); border-radius: var(--radius-sm);
-  padding: 0 var(--s4) 0 var(--s2); appearance: none; -webkit-appearance: none; cursor: pointer;
-}
 .topbar-right { display: flex; align-items: center; justify-content: flex-end; gap: var(--s2); }
 .user-menu { display: flex; align-items: center; gap: var(--s2); }
 
@@ -114,18 +109,50 @@ button, input, select { font-family: inherit; font-size: inherit; }
 .facet-group li:hover { background: var(--base-2); }
 .facet-group li.active { background: var(--accent-dim); color: var(--accent); }
 .facet-group li .count { color: var(--muted); font-size: 12px; }
+#facet-tags li { padding: 0; }
+#facet-tags button {
+  display: flex; justify-content: space-between; align-items: center; gap: var(--s1);
+  width: 100%; padding: var(--s1) var(--s2); border: 0; border-radius: inherit;
+  background: transparent; color: inherit; text-align: left; cursor: pointer;
+}
 
 /* ---------- content ---------- */
 .content { padding: var(--s4); overflow: auto; }
 .view-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--s3); gap: var(--s2); }
 .view-head h2 { margin: 0; font-size: 22px; }
-.view-controls { display: flex; align-items: center; gap: var(--s2); }
+.view-controls { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: var(--s2); }
 .view-controls select, .table select {
   background: var(--base-1) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%2364708a' stroke-width='1.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 12px center;
   border: 1px solid var(--base-3); color: var(--text); border-radius: var(--radius-sm);
   padding: var(--s1) var(--s4) var(--s1) var(--s2); appearance: none; -webkit-appearance: none; cursor: pointer;
 }
-.chip { background: var(--accent-dim); color: var(--accent); padding: 6px var(--s2); border-radius: 999px; font-size: 13px; cursor: pointer; }
+/* 窄屏下标签输入区自动换行，已选条件也可以折行。 */
+.library-filters {
+  margin-bottom: var(--s3); padding: var(--s2);
+  background: var(--base-1); border: 1px solid var(--base-3); border-radius: var(--radius);
+}
+.tag-filter-fields {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  gap: var(--s2);
+}
+.tag-filter { display: grid; gap: var(--s1); align-content: start; }
+.tag-filter label { font-size: 13px; font-weight: 600; }
+.tag-filter-entry { display: flex; gap: var(--s1); }
+.tag-filter-entry input {
+  flex: 1; min-width: 0; padding: var(--s1) var(--s2);
+  border: 1px solid var(--base-3); border-radius: var(--radius-sm);
+  background: var(--base-0); color: var(--text);
+}
+.tag-filter-values { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s1); min-width: 0; }
+.tag-filter-values:empty { display: none; }
+.library-filter-scope { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s1); margin-top: var(--s1); }
+#clear-filters { margin-left: auto; }
+#clear-filters:disabled { opacity: .55; cursor: default; }
+.chip {
+  max-width: 100%; overflow-wrap: anywhere; text-align: left;
+  background: var(--accent-dim); color: var(--accent-soft); border: 0;
+  padding: 6px var(--s2); border-radius: 999px; font-size: 13px; cursor: pointer;
+}
 .chip::after { content: " \00d7"; }
 
 /* ---------- grid ---------- */
@@ -141,6 +168,13 @@ button, input, select { font-family: inherit; font-size: inherit; }
 .card .meta .sub { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
 .badge { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--accent); }
 .empty { padding: var(--s5); text-align: center; color: var(--muted); }
+#library-error .btn { margin-left: var(--s1); }
+/* 分页按钮和页码在窄屏上可以自动换行。 */
+.library-pagination {
+  display: flex; align-items: center; justify-content: center; flex-wrap: wrap;
+  gap: var(--s2); margin-top: var(--s3);
+}
+.library-pagination .btn:disabled { opacity: .55; cursor: default; }
 
 /* ---------- drawer (asset detail) ---------- */
 .drawer { position: fixed; inset: 0; z-index: 40; }
